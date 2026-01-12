@@ -75,6 +75,7 @@ pub struct FunctionParameter {
     #[serde(rename = "type")]
     #[serde(default = "ParameterType::string")]
     pub parameter_type: ParameterType,
+    #[serde(default)]
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
@@ -110,17 +111,17 @@ impl Serialize for FunctionParameter {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ParameterType {
-    #[serde(rename = "int")]
+    #[serde(rename = "int", alias = "integer")]
     Int,
-    #[serde(rename = "float")]
+    #[serde(rename = "float", alias = "number")]
     Float,
-    #[serde(rename = "bool")]
+    #[serde(rename = "bool", alias = "boolean")]
     Bool,
-    #[serde(rename = "str")]
+    #[serde(rename = "str", alias = "string")]
     String,
-    #[serde(rename = "list")]
+    #[serde(rename = "list", alias = "array")]
     List,
-    #[serde(rename = "dict")]
+    #[serde(rename = "dict", alias = "object", alias = "dictionary")]
     Dict,
 }
 
