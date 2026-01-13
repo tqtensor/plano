@@ -8,6 +8,10 @@ use tracing::{debug, warn};
 use super::router_model::{RouterModel, RoutingModelError};
 
 pub const MAX_TOKEN_LEN: usize = 2048; // Default max token length for the routing model
+const TOKEN_LENGTH_DIVISOR: usize = 4; // Approximate token length divisor for UTF-8 characters
+                                       // Max characters per message for routing - derived from MAX_TOKEN_LEN
+                                       // Using 1/4 of the total token budget per message to allow room for multiple messages
+const MAX_MESSAGE_CHARS_FOR_ROUTING: usize = (MAX_TOKEN_LEN * TOKEN_LENGTH_DIVISOR) / 4; // ~2048 chars
 pub const ARCH_ROUTER_V1_SYSTEM_PROMPT: &str = r#"
 You are a helpful assistant designed to find the best suited route.
 You are provided with route description within <routes></routes> XML tags:
@@ -63,8 +67,6 @@ impl RouterModelV1 {
 struct LlmRouterResponse {
     pub route: Option<String>,
 }
-
-const TOKEN_LENGTH_DIVISOR: usize = 4; // Approximate token length divisor for UTF-8 characters
 
 impl RouterModel for RouterModelV1 {
     fn generate_request(
@@ -129,14 +131,25 @@ impl RouterModel for RouterModelV1 {
         }
 
         // Reverse the selected messages to maintain the conversation order
+        // Also truncate message content to MAX_MESSAGE_CHARS_FOR_ROUTING to prevent
+        // overwhelming the router model with large file contents
         let selected_conversation_list = selected_messages_list_reversed
             .iter()
             .rev()
             .map(|message| {
+                let content_str = message.content.to_string();
+                let truncated_content = if content_str.len() > MAX_MESSAGE_CHARS_FOR_ROUTING {
+                    // Truncate and add indicator that content was truncated
+                    format!(
+                        "{}...[truncated]",
+                        &content_str[..MAX_MESSAGE_CHARS_FOR_ROUTING]
+                    )
+                } else {
+                    content_str
+                };
                 Message {
                     role: message.role.clone(),
-                    // we can unwrap here because we have already filtered out messages without content
-                    content: MessageContent::Text(message.content.to_string()),
+                    content: MessageContent::Text(truncated_content),
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -174,7 +187,21 @@ impl RouterModel for RouterModelV1 {
             return Ok(None);
         }
         let router_resp_fixed = fix_json_response(content);
-        let router_response: LlmRouterResponse = serde_json::from_str(router_resp_fixed.as_str())?;
+
+        // Try to parse the JSON, but gracefully return None if it fails
+        // This handles cases where the router model returns garbage or unexpected responses
+        let router_response: LlmRouterResponse = match serde_json::from_str(
+            router_resp_fixed.as_str(),
+        ) {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!(
+                    "Failed to parse router response as JSON, falling back to no route. Error: {:?}, Content: {:?}",
+                    e, router_resp_fixed
+                );
+                return Ok(None);
+            }
+        };
 
         let selected_route = router_response.route.unwrap_or_default().to_string();
 
@@ -257,25 +284,41 @@ fn convert_to_router_preferences(
 fn fix_json_response(body: &str) -> String {
     let mut updated_body = body.to_string();
 
+    // Strip markdown code block markers first
+    if updated_body.contains("```json") {
+        updated_body = updated_body.replace("```json", "");
+    }
+    if updated_body.contains("```") {
+        updated_body = updated_body.replace("```", "");
+    }
+
+    // Find the first '{' and last '}' to extract the JSON object
+    if let Some(start) = updated_body.find('{') {
+        if let Some(end) = updated_body.rfind('}') {
+            if end > start {
+                updated_body = updated_body[start..=end].to_string();
+            }
+        }
+    }
+
+    // Replace single quotes with double quotes
     updated_body = updated_body.replace("'", "\"");
 
-    if updated_body.contains("\\n") {
-        updated_body = updated_body.replace("\\n", "");
-    }
+    // Remove ALL newlines and carriage returns - collapse to single line
+    // This fixes "control character in string" errors when LLM outputs multiline JSON
+    updated_body = updated_body.replace("\r\n", " ");
+    updated_body = updated_body.replace("\n", " ");
+    updated_body = updated_body.replace("\r", " ");
 
-    if updated_body.starts_with("```json") {
-        updated_body = updated_body
-            .strip_prefix("```json")
-            .unwrap_or(&updated_body)
-            .to_string();
-    }
+    // Remove escaped newlines too
+    updated_body = updated_body.replace("\\n", "");
+    updated_body = updated_body.replace("\\r", "");
 
-    if updated_body.ends_with("```") {
-        updated_body = updated_body
-            .strip_suffix("```")
-            .unwrap_or(&updated_body)
-            .to_string();
-    }
+    // Remove any other control characters (0x00-0x1F except space which is 0x20)
+    updated_body = updated_body.chars().filter(|c| !c.is_control()).collect();
+
+    // Trim whitespace
+    updated_body = updated_body.trim().to_string();
 
     updated_body
 }
@@ -809,10 +852,10 @@ Based on your analysis, provide your response in the following JSON formats if y
         let result = router.parse_response(input, &None).unwrap();
         assert_eq!(result, None);
 
-        // Case 5: Malformed JSON
+        // Case 5: Malformed JSON - gracefully returns None instead of error
         let input = r#"{"route": "route1""#; // missing closing }
-        let result = router.parse_response(input, &None);
-        assert!(result.is_err());
+        let result = router.parse_response(input, &None).unwrap();
+        assert_eq!(result, None);
 
         // Case 6: Single quotes and \n in JSON
         let input = "{'route': 'Image generation'}\\n";

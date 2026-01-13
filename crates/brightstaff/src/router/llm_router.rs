@@ -30,6 +30,9 @@ pub enum RoutingError {
     #[error("Failed to parse JSON: {0}, JSON: {1}")]
     JsonError(serde_json::Error, String),
 
+    #[error("Upstream error: status {0}, body {1}")]
+    UpstreamError(reqwest::StatusCode, String),
+
     #[error("Router model error: {0}")]
     RouterModelError(#[from] super::router_model::RoutingModelError),
 }
@@ -141,17 +144,23 @@ impl RouterService {
             .send()
             .await?;
 
+        let status = res.status();
         let body = res.text().await?;
         let router_response_time = start_time.elapsed();
+
+        if !status.is_success() {
+            tracing::error!(
+                "Router upstream returned error status: {}. Body: {}",
+                status,
+                body
+            );
+            return Err(RoutingError::UpstreamError(status, body));
+        }
 
         let chat_completion_response: ChatCompletionsResponse = match serde_json::from_str(&body) {
             Ok(response) => response,
             Err(err) => {
-                warn!(
-                    "Failed to parse JSON: {}. Body: {}",
-                    err,
-                    &serde_json::to_string(&body).unwrap()
-                );
+                tracing::error!("Failed to parse JSON: {}. Body: {}", err, body);
                 return Err(RoutingError::JsonError(
                     err,
                     format!("Failed to parse JSON: {}", body),
